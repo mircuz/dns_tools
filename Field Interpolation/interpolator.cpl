@@ -1,0 +1,7 @@
+gamma=0
+USE dnsdata
+read_restart_file; 
+WRITE "Filling the interpolated array V with the values coming from " restart_file
+populate_new_array
+interpolate
+write_data

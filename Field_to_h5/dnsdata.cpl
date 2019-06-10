@@ -1,0 +1,293 @@
+USE fft
+USE rbmat
+
+!// Parallel - initialization---------------------------------------------------------------------------
+WRITE 
+<*/* Initialize MPI */
+MPI_Init(&argc,&argv);
+MPI_Comm remap_comm; // @suppress("Type cannot be resolved")
+MPI_Comm_dup( MPI_COMM_WORLD, &remap_comm ); // @suppress("Symbol is not resolved")
+int rank,size;
+MPI_Comm_size(MPI_COMM_WORLD,&size);
+MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+rank_ = rank;
+size_ = size;
+
+*>
+
+!// Variables initialization-----------------------------------------------------------------------------
+INTEGER ny,nx,nz,rank_zero_flag=0,rank_zero,maxtimelevels=1,flag_veta=0,nproc_y,nproc_z
+REAL alfa0, beta0, a, ymin, ymax, t_max, dt_field, dt_save
+REAL u_conv, u0, un, w_conv, w0, wn, t0, tn
+REAL ni,pr,meanpx=-99,meanpz=-99,meanflowx=-99,meanflowz=-99,px=0,corrpx=0,pz=0,corrpz=0,flowx=0,flowz=0,deltat=0, cflmax=0, time=0 
+REAL starting_time
+BOOLEAN generate_inputs
+STRING restart_file
+CHAR cwd[1024], output_cwd[1024]
+FILE time_file; IF rank=0 THEN time_file=CREATE("Runtimedata")
+INTEGER localdim_x, localdim_z, dim_z, dim_y, ilo,ihi,jlo,jhi,klo,khi,  x_ilo,x_ihi,x_jlo,x_jhi,x_klo,x_khi,
+																		y_ilo,y_ihi,y_jlo,y_jhi,y_klo,y_khi,
+																		z_ilo,z_ihi,z_jlo,z_jhi,z_klo,z_khi,
+																		fz_ilo,fz_ihi,fz_jlo,fz_jhi,fz_klo,fz_khi
+!// Structures initialization----------------------------------------------------------------------------
+VELOCITY=STRUCTURE(COMPLEX u,v,w)
+MOMFLUX=STRUCTURE(COMPLEX uu,uv,vv,vw,ww,uw)
+INLINE FUNCTION OS(INTEGER iy,i)=ni*[d4(i)-2*k2*d2(i)+k2*k2*d0(i)]
+INLINE FUNCTION SQ(INTEGER iy,i)=ni*[d2(i)-k2*d0(i)]
+rhstype=STRUCTURE(COMPLEX eta,D2v)
+VETA=STRUCTURE(COMPLEX v,eta)
+INLINE FUNCTION imod(INTEGER iy)=(iy+1000)MOD(5)
+REAL u1zero=0, w1zero=0
+<* typedef struct complex {
+		double 	real;
+		double	imag;
+  	} complex; *>
+
+!// Routine to read data from the structure MOMFLUX------------------------------------------------------	
+SUBROUTINE y_pencil_parser_mom( POINTER TO ARRAY(*,*,*) OF MOMFLUX VV; INTEGER start_mode_x; INTEGER end_mode_x;
+				  INTEGER start_mode_z; INTEGER end_mode_z; INTEGER desidered_rank)
+	IF rank = desidered_rank THEN 
+		INTEGER loop_mode_x = start_mode_x;		INTEGER loop_end_mode_x = nx
+		LOOP FOR mode_z= start_mode_z TO end_mode_z
+			IF mode_z = end_mode_z THEN loop_end_mode_x = end_mode_x-1
+			LOOP FOR mode_x= loop_mode_x TO loop_end_mode_x
+				WRITE "==============(nx=" mode_x", nz=" mode_z ")================"
+				LOOP FOR mode_y=-1 TO ny+1
+					WRITE "("mode_x","mode_z","mode_y")  " VV(mode_x,mode_z,mode_y)
+				REPEAT LOOP	
+				loop_mode_x = 0;
+			REPEAT LOOP
+		REPEAT LOOP
+	END IF
+END y_pencil_parser_mom
+
+!// Routine to read data from the structure VELOCITY-----------------------------------------------------	
+SUBROUTINE y_pencil_parser_vel( POINTER TO ARRAY(*,*,*) OF VELOCITY VV; INTEGER start_mode_x; INTEGER end_mode_x;
+				  INTEGER start_mode_z; INTEGER end_mode_z; INTEGER desidered_rank)
+	IF rank = desidered_rank THEN 
+		INTEGER loop_mode_x = start_mode_x;		INTEGER loop_end_mode_x = nx
+		LOOP FOR mode_z= start_mode_z TO end_mode_z
+			IF mode_z = end_mode_z THEN loop_end_mode_x = end_mode_x-1
+			LOOP FOR mode_x= loop_mode_x TO loop_end_mode_x
+				WRITE "==============(nx=" mode_x", nz=" mode_z ")================"
+				LOOP FOR mode_y=-1 TO ny+1
+					WRITE "("mode_x","mode_z","mode_y")  " VV(mode_x,mode_z,mode_y)
+				REPEAT LOOP	
+				loop_mode_x = 0;
+			REPEAT LOOP
+		REPEAT LOOP
+	END IF
+END y_pencil_parser_vel
+
+!// read_initial_data------------------------------------------------------------------------------------
+SUBROUTINE read_initial_data
+	FILE in_data=OPEN("dns.in")
+	READ BY NAME FROM in_data ny,nx,nz,alfa0,beta0,ymin,ymax,a,ni,pr; ni=1/ni; pr=1/pr
+	DO WHILE READ BY NAME FROM in_data meanpx OR meanflowx; px=meanpx
+	DO WHILE READ BY NAME FROM in_data meanpz OR meanflowz; pz=meanpz
+	READ BY NAME FROM in_data u_conv, w_conv
+	READ BY NAME FROM in_data u0, un, w0, wn, t0, tn
+	DO WHILE READ BY NAME FROM in_data deltat OR cflmax
+	READ BY NAME FROM in_data t_max, starting_time, dt_field, dt_save
+	READ BY NAME FROM in_data generate_inputs, nproc_y, nproc_z;
+	READ BY NAME FROM in_data restart_file
+
+	CLOSE in_data
+	IF rank= 0 THEN
+		WRITE BY NAME nx, nz, ny, time
+    	WRITE BY NAME meanflowx, meanpx, meanflowz, meanpz
+   	 	WRITE BY NAME ymin, ymax, a, alfa0, beta0, 1/ni, 1/pr
+   	 WRITE BY NAME u_conv, u0, un, w_conv, w0, wn, t0, tn
+   	 WRITE BY NAME deltat, cflmax, t_max, dt_save, dt_field  
+	END IF
+END read_initial_data
+
+BOOLEAN reread=NO
+SUBROUTINE kill_received(INTEGER signum)
+	reread=YES
+END kill_received
+
+read_initial_data; signal(SIGUSR2,kill_received)
+
+!// FFT Dimensions---------------------------------------------------------------------------------------
+INTEGER nxd = (nx)*3 DIV 2 -1 ;	INTEGER nzd = 3*nz-1;
+DO INC nxd UNTIL FFTfit(nxd);	
+DO INC nzd UNTIL FFTfit(nzd);
+
+!// X-FFT------------------------------------------------------------------------------------------------
+SUBROUTINE FFT_x(POINTER TO ARRAY(*) OF REAL work; INTEGER elem_per_proc; INTEGER flag)
+ARRAY(0..nxd-1) OF COMPLEX in
+	INTEGER count = 0, n=0, i=0;
+	LOOP WHILE ( count < elem_per_proc/(2*nxd))
+		!// fill IN array
+		i=0
+		LOOP WHILE i < 2*nxd-1
+			in[n].REAL = work[i+count*2*nxd];		INC i
+			in[n].IMAG = work[i+count*2*nxd];		INC i
+			INC n
+		REPEAT LOOP
+		!// Execute FFT exploting symmetry
+		IF flag = 1 THEN RFTU(in) ELSE IF flag = -1 THEN HFTU(in) ELSE ERROR ".:Error: Check x-FFT flag:.		"
+		!// Push data inside original array
+		INTEGER r=0
+		i=0; n=0;
+		LOOP WHILE i < 2*nxd-1
+			work[i+count*2*nxd] = in[r].REAL;		INC i
+			work[i+count*2*nxd] = in[r].IMAG;		INC i
+			INC r
+		REPEAT LOOP
+		INC count
+	REPEAT LOOP
+END FFT_x
+
+!// Z-FFT------------------------------------------------------------------------------------------------
+SUBROUTINE FFT_z(POINTER TO ARRAY(*) OF REAL work; INTEGER elem_per_proc; INTEGER flag)
+ARRAY(0..nzd-1) OF COMPLEX in
+	INTEGER count = 0, n=0, i=0;
+	LOOP WHILE ( count < elem_per_proc/(2*nzd))
+		!// fill IN array
+		i=0
+		LOOP WHILE i < 2*nzd-1
+			in[n].REAL = work[i+count*2*nzd];		INC i
+			in[n].IMAG = work[i+count*2*nzd];		INC i
+			INC n
+		REPEAT LOOP
+		!// Execute FFT exploting symmetry
+		IF flag = 1 THEN IFTU(in) ELSE IF flag = -1 THEN FFTU(in) ELSE ERROR ".:Error: Wrong z-FFT flag setted:.		"
+		!// Push data inside original array
+		INTEGER r=0
+		i=0; n=0;
+		LOOP WHILE i < 2*nzd-1
+			work[i+count*2*nzd] = in[r].REAL;		INC i
+			work[i+count*2*nzd] = in[r].IMAG;		INC i
+			INC r
+		REPEAT LOOP
+		INC count
+	REPEAT LOOP
+END FFT_z
+
+!// Grid in y direction and compact finite differences operators----------------------------------------
+REAL y(-1..ny+1)
+!DO y(i)=ymin+(ymax-ymin)*i/ny FOR ALL i !Mesh equispaziata
+!DO y(i)=ymin+(ymax-ymin)*[tanh(a*(i/ny-1))/tanh(a)+1] FOR ALL i !Boundary layer
+DO y(i)=ymin+0.5*(ymax-ymin)*[tanh(a*(2*i/ny-1))/tanh(a)+0.5*(ymax-ymin)] FOR ALL i !Channel
+
+STRUCTURE[ARRAY(-2..2) OF REAL d0,d1,d2,d4] derivatives(1..ny-1) 
+ARRAY(-2..2) OF REAL d040,d140,d240,d340,d14m1,d24m1, d04n,d14n,d24n,d14np1,d24np1
+
+!// Setup derivatives-----------------------------------------------------------------------------------
+MODULE setup_derivatives
+REAL M(0..4,0..4),t(0..4)
+LOOP FOR iy=1 TO ny-1 WITH derivatives(iy)
+  	DO M(i,j)=(y(iy-2+j)-y(iy))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+  	t=0; t(0)=24
+  	d4(-2+(*))=M\t
+  	DO M(i,j)=(5-i)*(6-i)*(7-i)*(8-i)*(y(iy-2+j)-y(iy))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+ 	 DO t(i)=SUM {d4(j)*(y(iy+j)-y(iy))**(8-i)} FOR j=-2 TO 2 FOR i=0 TO 4
+	  d0(-2+(*))=M\t
+ 	 DO M(i,j)=(y(iy-2+j)-y(iy))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+  	t=0; DO t(i)=SUM d0(j)*(4-i)*(3-i)*(y(iy+j)-y(iy))**(2-i) FOR j=-2 TO 2 FOR i=0 TO 2
+  	d2(-2+(*))=M\t
+  	t=0; DO t(i)=SUM d0(j)*(4-i)*(y(iy+j)-y(iy))**(3-i) FOR j=-2 TO 2 FOR i=0 TO 3
+  	d1(-2+(*))=M\t
+REPEAT
+
+d040=0; d040(-1)=1
+DO M(i,j)=(y(-1+j)-y(0))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+t=0; t(3)=1
+d140(-2+(*))=M\t
+t=0; t(2)=2
+d240(-2+(*))=M\t
+t=0; t(3)=6
+d340(-2+(*))=M\t
+DO M(i,j)=(y(-1+j)-y(-1))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+t=0; t(3)=1
+d14m1(-2+(*))=M\t
+t=0; t(2)=2
+d24m1(-2+(*))=M\t
+
+d04n=0; d04n(1)=1
+DO M(i,j)=(y(ny-3+j)-y(ny))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+t=0; t(3)=1
+d14n(-2+(*))=M\t
+t=0; t(2)=2
+d24n(-2+(*))=M\t
+DO M(i,j)=(y(ny-3+j)-y(ny+1))**(4-i) FOR i=0 TO 4 AND j=0 TO 4; LUdecomp M
+t=0; t(3)=1
+d14np1(-2+(*))=M\t
+t=0; t(2)=2
+d24np1(-2+(*))=M\t
+
+END setup_derivatives
+
+!// Setup Boundary conditions variables---------------------------------------------------------------------		
+ARRAY(1..ny-1,-2..2) OF REAL D0mat=0
+D0mat(1..ny-1)=derivatives.d0; LUdecomp D0mat
+D0mat(1,-2..-1) = 0; 	D0mat(2,-2) = 0
+D0mat(ny-1,1..2) = 0; 	D0mat(ny-2,2) = 0
+ARRAY(-2..2) OF REAL v0bc(-1..0)=0,vnbc(0..1)=0,eta0bc(-1..0)=0,etanbc(0..1)=0
+
+v0bc(0)=d040; v0bc(-1)=d140; eta0bc(0)=d040
+eta0bc(-1)=derivatives(1).d4
+DO v0bc(0)(i)=~-v0bc(0)(-2)*v0bc(-1)(i)/v0bc(-1)(-2) FOR i= -1 TO 2
+DO eta0bc(0)(i)=~-eta0bc(0)(-2)*eta0bc(-1)(i)/eta0bc(-1)(-2) FOR i= -1 TO 2
+
+! vnbc(0)=d04n; vnbc(1)=d24n; etanbc(0)=d14n !Boundary layer
+vnbc(0)=d04n; vnbc(1)=d14n; etanbc(0)=d04n
+etanbc(1)=derivatives(ny-1).d4
+DO vnbc(0)(i)=~-vnbc(0)(2)*vnbc(1)(i)/vnbc(1)(2) FOR i= -2 TO 1
+DO etanbc(0)(i)=~-etanbc(0)(2)*etanbc(1)(i)/etanbc(1)(2) FOR i= -2 TO 1
+
+!// Function to apply Boundary conditions------------------------------------------------------------------
+SUBROUTINE applybc_0(ARRAY(*) OF REAL eq^(*); ARRAY(-1..0,-2..2) OF REAL bc) 
+  	DO eq(1,i)=~-eq(1,-2)*bc(-1,i)/bc(-1,-2) FOR i=-1 TO 2
+  	DO eq(1,i)=~-eq(1,-1)*bc(0,i)/bc(0,-1) FOR i=0 TO 2
+  	DO eq(2,i-1)=~-eq(2,-2)*bc(0,i)/bc(0,-1) FOR i=0 TO 2
+END applybc_0
+SUBROUTINE applybc_n(ARRAY(*) OF REAL eq^(*); ARRAY(0..1,-2..2) OF REAL bc) 
+  	DO eq(ny-1,i)=~-eq(ny-1,2)*bc(1,i)/bc(1,2) FOR i=-2 TO 1
+  	DO eq(ny-1,i)=~-eq(ny-1,1)*bc(0,i)/bc(0,1) FOR i=-2 TO 0
+  	DO eq(ny-2,i+1)=~-eq(ny-2,2)*bc(0,i)/bc(0,1) FOR i=-2 TO 0
+END applybc_n
+
+!// Integral in y direction-------------------------------------------------------------------------------
+SUBROUTINE yintegr(REAL RESULT^, f(*))
+  LOOP FOR iy=1 TO ny-1 BY 2 
+   yp1=y(iy+1)-y(iy); ym1=y(iy-1)-y(iy) 
+   a1=-1/3*ym1+1/6*yp1+1/6*yp1*yp1/ym1
+   a3=+1/3*yp1-1/6*ym1-1/6*ym1*ym1/yp1
+   a2=yp1-ym1-a1-a3
+   RESULT=~+a1*f(iy-1) + a2*f(iy) + a3*f(iy+1)    
+  REPEAT
+END yintegr
+
+SUBROUTINE setup_file
+	<*	int nx= nx_+1;	int nz= 2*nz_+1;	int ny=ny_+3;		int size= size_; 	int rank = rank_; 	int mem_reader;
+		//if( chdir(output_cwd_) !=0 )
+		//if( chdir("/media/sf_Materiale_Tesi") !=0 )
+			//perror(".:Error changing folder in outstats routine:.");
+		hid_t plist_id0, file_id0;
+		/*Set up file access property list with parallel I/O access*/
+   		plist_id0 = H5Pcreate(H5P_FILE_ACCESS);
+    	H5Pset_fapl_mpio(plist_id0, MPI_COMM_WORLD, MPI_INFO_NULL);
+    	/*Create a new file collectively and release property list identifier*/
+    	file_id0 = H5Fcreate("0.h5", H5F_ACC_TRUNC, H5P_DEFAULT, plist_id0);
+    	H5Pclose(plist_id0);
+		H5Fclose(file_id0); *> 
+END setup_file 
+
+!// Set starting time of simulation
+SUBROUTINE set_time
+	time = starting_time
+	IF rank=0 THEN 
+		WRITE "Simulation starts from " time "s"
+		WRITE TO time_file "time","u1zero", ,"u_fin", ,"w1zero", , ,"w_fin", ,,"flowx",
+								  "px+corrpx", "flowz", , ,"pz+corrpz", "deltat","energy_tot","diss_tot"
+	END IF
+	IF time = 0.0 THEN 
+		setup_file
+		IF generate_inputs = TRUE THEN
+			IF rank=0 THEN WRITE "Random field will be generated" 
+		END IF
+	END IF
+END set_time

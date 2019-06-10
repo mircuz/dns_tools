@@ -1,0 +1,263 @@
+!USE rtchecks
+USE fft
+USE rbmat
+USE parallel
+nsmp=1
+
+! Parallel - initialization
+INTEGER iproc,nproc
+IF COMMANDLINE.HI<1 THEN iproc=1; nproc=1 ELSE
+iproc=atoi(COMMANDLINE(1)); nproc=atoi(COMMANDLINE(2)); END IF
+bufsize=800; baseport=IPPORT_USERRESERVED+111
+FILE prev,next
+IF iproc<nproc THEN
+  next=fdopen(tcpserver(baseport+iproc),"r+")
+  setvbuf(next,malloc(bufsize),_IOFBF,bufsize)
+END IF
+IF iproc>1 THEN
+  prev=fdopen(tcpclient(COMMANDLINE(3),baseport+iproc-1),"r+")
+  setvbuf(prev,malloc(bufsize),_IOFBF,bufsize)
+END IF
+first==(prev=NULL FILE); last==(next=NULL FILE); has_terminal==last
+
+
+USE rbmatmod
+
+INTEGER ny,nx,nz, new_ny, new_nx, new_nz
+REAL alfa0, new_alfa0, beta0, new_beta0, a, ymin, ymax, t_max, dt_field, dt_save
+REAL u_conv, u0, un, w_conv, w0, wn, t0, tn
+REAL ni, new_ni,pr,meanpx=-99,meanpz=-99,meanflowx=-99,meanflowz=-99,px=0,corrpx=0,pz=0,corrpz=0,flowx=0,flowz=0,deltat=0, cflmax=0, time=0
+STRING restart_file
+
+
+SUBROUTINE read_initial_data
+ FILE in_data=OPEN("dns.in")
+ READ BY NAME FROM in_data ny,nx,nz,alfa0,beta0,ymin,ymax,a,ni,pr; ni=1/ni; pr=1/pr
+ READ BY NAME FROM in_data new_ny, new_nx, new_nz,new_alfa0,new_beta0,new_ni; new_ni=1/new_ni
+ WRITE BY NAME "Original field dimensions are:" nx, nz, ny
+ WRITE BY NAME "Interpolated field dimensions are:" new_nx, new_nz, new_ny
+ IF NOT READ BY NAME FROM in_data restart_file THEN restart_file=""
+ CLOSE in_data
+END read_initial_data
+
+BOOLEAN reread=NO
+SUBROUTINE kill_received(INTEGER signum)
+ reread=YES
+END kill_received
+
+read_initial_data; signal(SIGUSR2,kill_received)
+
+! Grid in y direction and compact finite differences operators
+nyl=1+(iproc-1)*(ny-1) DIV nproc; nyh=iproc*(ny-1) DIV nproc
+REAL y(MAX(-1,nyl-4)..MIN(ny+1,nyh+4))
+
+
+VELOCITY=STRUCTURE(COMPLEX u,v,w)
+MOMFLUX=STRUCTURE(COMPLEX uu,uv,vv,vw,ww,uw)
+!INLINE FUNCTION OS(INTEGER iy,i)=0.5*[d4(i)-2*k2*d2(i)+k2*k2*d0(i)] !Vittori
+!INLINE FUNCTION SQ(INTEGER iy,i)=0.5*[d2(i)-k2*d0(i)]               !Vittori
+INLINE FUNCTION OS(INTEGER iy,i)=ni*[d4(i)-2*k2*d2(i)+k2*k2*d0(i)]
+INLINE FUNCTION SQ(INTEGER iy,i)=ni*[d2(i)-k2*d0(i)]
+
+INTEGER nxd=3*nx DIV 2 - 1; DO INC nxd UNTIL FFTfit(nxd)
+INTEGER nzd=3*nz - 1; DO INC nzd UNTIL FFTfit(nzd)
+SHARED ARRAY(0..nxd-1,0..nzd-1) OF VELOCITY Vd
+SHARED ARRAY(0..nxd-1,0..nzd-1,0..4) OF MOMFLUX VVd
+#ifdef bodyforce
+ FORCE=STRUCTURE(COMPLEX fx,fy,fz)
+ SHARED ARRAY(0..nx,-nz..nz,nyl-2..nyh+2) OF FORCE F
+#endif
+
+maxtimelevels=1
+rhstype=STRUCTURE(COMPLEX eta,D2v)
+VETA=STRUCTURE(COMPLEX v,eta)
+SHARED ARRAY(0..nx,-nz..nz,nyl-2..nyh+2) OF VELOCITY V
+ARRAY(0..new_nx,-new_nz..new_nz,-1..new_ny+1) OF VELOCITY new_V
+SHARED ARRAY(0..nx,-nz..nz,MAX(1,nyl-2)..MIN(ny-1,nyh+2),1..maxtimelevels) OF rhstype oldrhs
+SHARED rhstype memrhs(0..nx,-nz..nz,0..2)
+INLINE FUNCTION newrhs(INTEGER ix,iz,iy)=memrhs(ix,iz,(iy+1000)MOD(3))
+INLINE FUNCTION imod(INTEGER iy)=(iy+1000)MOD(5)
+REAL u1zero=0, w1zero=0
+
+#ifdef scalar
+  SFLUX=STRUCTURE(COMPLEX phiu,phiv,phiw)
+  SHARED ARRAY(0..nxd-1,0..nzd-1) OF COMPLEX phid
+  SHARED ARRAY(0..nxd-1,0..nzd-1,0..4) OF SFLUX SVd
+
+  SHARED ARRAY(0..nx,-nz..nz,nyl-2..nyh+2) OF COMPLEX phi
+  SHARED ARRAY(0..nx,-nz..nz,MAX(1,nyl-2)..MIN(ny-1,nyh+2),1..maxtimelevels) OF COMPLEX oldphirhs
+  SHARED COMPLEX memphirhs(0..nx,-nz..nz,0..2)
+  INLINE FUNCTION newphirhs(INTEGER ix,iz,iy)=memphirhs(ix,iz,(iy+1000)MOD(3))
+#endif
+
+INTEGER ismp
+
+
+POINTER TO STORED STRUCTURE(
+  ARRAY(0..1023) OF CHAR header
+  ARRAY(-1..ny+1,0..nx,-nz..nz) OF VELOCITY Vimage
+  ) diskimage
+POINTER TO STORED STRUCTURE(
+  ARRAY(0..1023) OF CHAR header
+  ARRAY(-1..new_ny+1,0..new_nx,-new_nz..new_nz) OF VELOCITY Vimage_interpoled
+  ) diskimage_interpoled
+POINTER TO STORED STRUCTURE(
+  INTEGER nyimage,nximage,nzimage
+  REAL timage,yminimage,ymaximage,aimage,alfa0image,beta0image,niimage
+  ARRAY(-1..ny+1) OF REAL uavimage,wavimage
+  ARRAY(-1..ny+1,0..nx,-nz..nz) OF VETA fieldimage
+  ) diskfield
+#endif
+
+INTEGER cont=0,outcont=1000
+FILE time_file; IF has_terminal THEN time_file=CREATE("Runtimedata")
+#ifdef scalar
+ FILE scalar_file; IF has_terminal THEN scalar_file=CREATE("Scalardata")
+#endif
+INTEGER miny,maxy
+IF first THEN miny=nyl-2; maxy=nyh   ELSE miny=nyl
+IF last  THEN miny=nyl;   maxy=nyh+2 ELSE maxy=nyh
+IF first AND last THEN miny=nyl-2; maxy=nyh+2
+
+
+
+REAL energy, slice_energy, diss, slice_diss 
+COMPLEX dudy, dvdy, dwdy
+
+    
+SUBROUTINE read_restart_file
+IF restart_file="" THEN WRITE "No input field founded, aborting.."
+	IF has_terminal THEN WRITE "Reading from restart_file: ", restart_file
+	diskimage = OPEN(restart_file); WITH diskimage:
+	!READ BY NAME FROM header ny,nx,nz,alfa0,beta0,ymin,ymax,a,ni; ni=1/ni
+	LOOP FOR iy = nyl-2 TO nyh+2
+		V(*,*,iy) = Vimage(iy)
+	REPEAT LOOP
+	CLOSE diskimage
+DO WITH V(0,0,iy): u=~+u_conv; w=~+w_conv FOR ALL iy
+END read_restart_file
+
+
+REAL ny_read, ny_write, ny_fill, y_r=1
+ARRAY(0..new_ny) OF INTEGER y_i=0
+INTEGER i =0
+REAL delta_y
+
+SUBROUTINE populate_new_array
+ny_read = ny+3 - 6;	ny_write = new_ny+3 - 6  
+			!// I valori BC li copio direttamente
+delta_y = (new_ny-3)/(ny-3)
+
+!// y values of the new array in which write
+DO
+y_r = y_r+delta_y
+y_i(i) = FLOOR(y_r)
+INC i
+WHILE y_i(i-1) < new_ny -2
+
+!// Fill the new array
+LOOP FOR j=0 TO ny-2
+	LOOP FOR i=0 TO nx	
+		LOOP FOR k=-nz TO nz	
+			new_V(i,k,y_i(j))= V(i,k,j+2)
+		REPEAT
+	REPEAT
+REPEAT
+
+!// Apply BC to new array
+LOOP FOR j=-1 TO 1
+	LOOP FOR i=0 TO nx	
+		LOOP FOR k=-nz TO nz	
+			new_V(i,k,j)= V(i,k,j)
+			new_V(i,k,new_ny-j) = V(i,k,ny-j)
+		REPEAT
+	REPEAT
+REPEAT
+END populate_new_array
+
+
+SUBROUTINE interpolate_y
+!// Determine which planes need interpolation
+INTEGER counter=0
+ARRAY(0..new_ny) OF INTEGER y_to_interp
+LOOP FOR j=LO(y_i) TO HI(y_i)
+	IF y_i(j+1) -y_i(j) > 1 THEN 
+		y_to_interp(counter) = y_i(j)+1
+		INC counter
+	END IF
+REPEAT
+!// Interpolate those planes identified before
+LOOP FOR i=0 TO nx	
+	LOOP FOR k=-nz TO nz
+		LOOP interpole FOR j=0 TO new_ny
+			IF y_to_interp(j) = 0 THEN EXIT interpole	
+			new_V(i,k,y_to_interp(j)).u = (new_V(i,k,y_to_interp(j)-1).u + new_V(i,k,y_to_interp(j)+1).u )/2
+			new_V(i,k,y_to_interp(j)).v = (new_V(i,k,y_to_interp(j)-1).v + new_V(i,k,y_to_interp(j)+1).v )/2
+			new_V(i,k,y_to_interp(j)).w = (new_V(i,k,y_to_interp(j)-1).w + new_V(i,k,y_to_interp(j)+1).w )/2
+			!WRITE "Filling ("y_to_interp(j)")= " new_V(i,k,y_to_interp(j)).u
+		REPEAT interpole
+	REPEAT
+REPEAT 
+END interpolate_y
+
+SUBROUTINE Reynolds_scaling_factor
+REAL scaling_factor
+scaling_factor = new_ni/ni
+LOOP FOR i=0 TO nx
+	LOOP FOR k=-nz TO nz
+		LOOP FOR j=-1 TO new_ny
+			new_V(i,k,j).u = new_V(i,k,j).u * scaling_factor
+			new_V(i,k,j).v = new_V(i,k,j).v * scaling_factor
+			new_V(i,k,j).w = new_V(i,k,j).w * scaling_factor
+		REPEAT
+	REPEAT
+REPEAT 
+END Reynolds_scaling_factor
+
+
+SUBROUTINE interpolate_xz
+LOOP FOR i=nx+1 TO new_nx
+	LOOP FOR j=-1 TO new_ny+1
+		LOOP FOR k=-new_nz TO -nz-1
+			new_V(i,k,j).u=0;	new_V(i,k,j).v=0;	new_V(i,k,j).w=0
+		REPEAT
+		LOOP FOR k=nz+1 TO new_nz
+			new_V(i,k,j).u=0;	new_V(i,k,j).v=0;	new_V(i,k,j).w=0
+		REPEAT
+	REPEAT
+REPEAT
+END interpolate_xz
+
+SUBROUTINE interpolate
+interpolate_y
+Reynolds_scaling_factor
+interpolate_xz
+END interpolate
+
+SUBROUTINE write_data
+nx = new_nx; 	ny = new_ny; 	nz = new_nz
+VELOCITY velbuf(0..nx,-nz..nz)
+time=0
+DO WITH new_V(0,0,iy): u=~-u_conv; w=~-w_conv FOR ALL iy
+IF NOT first THEN READ FROM prev
+diskimage_interpoled = OPEN("Dati.cart.out")
+WITH diskimage_interpoled
+IF has_terminal THEN
+  WRITE "Writing Dati.cart.out at time", time
+  WRITE TO header <<??
+     ny=??ny??       nx=??nx??       nz=??nz??
+     alfa0=??alfa0??     beta0=??beta0??
+     ymin=??ymin??       ymax=??ymax??       a=??a??
+     ni=??1/ni??       time=??time??
+     ??
+END IF
+LOOP FOR iy = -1 TO new_ny+1
+	DO velbuf(0..nx,iz) = new_V(0..nx,iz,iy) FOR ALL iz
+	Vimage_interpoled(iy) = velbuf
+REPEAT LOOP
+!DO WRITE i,header(i) FOR i=0 TO 1023
+CLOSE diskimage
+IF NOT last THEN WRITE TO next
+DO WITH new_V(0,0,iy): u=~+u_conv; w=~+w_conv FOR ALL iy
+END write_data
+

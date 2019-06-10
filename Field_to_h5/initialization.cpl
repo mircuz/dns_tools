@@ -1,0 +1,200 @@
+WRITE
+<*
+  	/************************************************************************************************
+	 * 													      										*
+	 * 				Determine data for Pencil Decomposition and Scatter in MPI Space				*
+	 * 													      										*
+	 ************************************************************************************************
+											     	  					  Author: Dr. Mirco Meazzo */
+  
+  #include "fft_support.h"
+  getcwd(cwd_, sizeof(cwd_));
+  strcat(output_cwd_,cwd_);
+  strcat(output_cwd_,"/results");
+  if(rank==0) { 
+  	  printf("Running in: %s\n", cwd_);
+	  printf("Output in : %s\n", output_cwd_);
+  }
+  if( chdir(output_cwd_) !=0 )
+	  perror(".:Error changing folder in outstats routine:.");
+
+  int nfast,nmid,nslow, nx,ny,nz;
+  nx = nx_+1;		ny = ny_+3;	nz = nz_*2+1;
+  int nzd = nzd_;
+  int nxd = nxd_;	
+
+  // Length of the array along directions
+  int i_length = nxd;
+  int j_length = ny;
+  int k_length = nzd;
+
+  // Algorithm to factor Nprocs into roughly cube roots
+  int npfast,npmid,npslow;
+  npfast= 1;
+  int npmidslow = size / npfast;
+  npmid = (int) sqrt(npmidslow);
+  while (npmid < npmidslow) {
+    if (npmidslow % npmid == 0) break;
+    npmid++;
+  }
+  npslow = size / npfast / npmid;
+  // Override procs decomposition
+  if (nproc_y_ != 0 ) {
+	  if (rank==0) printf("\t\t---> Override processors decomposition");
+	  npmid = nproc_y_;
+	  npslow =nproc_z_;
+	  if (npmid*npslow != size ) {
+		  printf("Invalid manual decomposition\nAborting simulation...\n\n\n");
+		  abort();  
+	  }
+  }
+
+  int ipfast = rank % npfast;
+  int ipmid = (rank/npfast) % npmid;
+  int ipslow = rank / (npfast*npmid);
+  MPI_Barrier(MPI_COMM_WORLD);
+  
+  // Recap header
+  if (rank == 0) {
+  	  printf("\n========================================================================================\n"
+  			  "\t2D FFT with %dx%dx%d total modes, %dx%dx%d investigated on %d procs, %dx%dx%d grid\t\n"
+  			"========================================================================================\n\n",
+  			  nxd,ny,nzd,nx,ny,nz,size,npfast,npmid,npslow);
+    }  
+  // Sanity check
+  if ((ny/npmid) < 1) {
+	  perror("\n\n\nInvalid Y Grid decomposition\nAborting simulation...\n\n\n");
+	  abort();
+  }
+  if ((nz/npslow) < 1) {
+ 	  perror("\n\n\nInvalid Z Grid decomposition\nAborting simulation...\n\n\n");
+ 	  abort();
+   }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  /******************************************** Remap Variables *******************************************/
+  // partitioning in z-pencil
+  nfast = nzd;
+  nmid = nx;
+  nslow = ny;
+
+  int z_klo = (int) 1.0*ipfast*nfast/npfast;					// K fast
+  int z_khi = (int) 1.0*(ipfast+1)*nfast/npfast - 1;
+  int z_ilo = (int) 1.0*ipmid*nmid/npmid;						// I med
+  int z_ihi = (int) 1.0*(ipmid+1)*nmid/npmid - 1;
+  int z_jlo = (int) 1.0*ipslow*nslow/npslow;					// J slow
+  int z_jhi = (int) 1.0*(ipslow+1)*nslow/npslow - 1;
+
+  printf("[Z-PENCIL] (k,i,j order)\t"
+		  "On rank %d the coordinates are: "
+		  "(%d,%d,%d) -> (%d,%d,%d)\n", rank, z_ilo, z_jlo, z_klo, z_ihi, z_jhi, z_khi );
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // partitioning in x-pencil
+  nfast = nx;
+  nmid = ny;
+  nslow = nzd;
+
+  int x_ilo = (int) 1.0*ipfast*nfast/npfast;						// I fast
+  int x_ihi = (int) 1.0*(ipfast+1)*nfast/npfast - 1;
+  int x_jlo = (int) 1.0*ipmid*nmid/npmid;							// J med
+  int x_jhi = (int) 1.0*(ipmid+1)*nmid/npmid - 1;
+  int x_klo = (int) 1.0*ipslow*nslow/npslow;						// K slow
+  int x_khi = (int) 1.0*(ipslow+1)*nslow/npslow - 1; 
+
+  printf("[X-PENCIL] (i,j,k order)\t"
+		  "On rank %d the coordinates are: "
+		  "(%d,%d,%d) -> (%d,%d,%d)\n", rank, x_ilo, x_jlo, x_klo, x_ihi, x_jhi, x_khi );
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Final z-pencil
+  nfast = nz;
+  nmid = nx;
+  nslow = ny;
+
+  int fz_klo = (int) 1.0*ipfast*nfast/npfast;					// K fast
+  int fz_khi = (int) 1.0*(ipfast+1)*nfast/npfast - 1;
+  int fz_ilo = (int) 1.0*ipmid*nmid/npmid;						// I med
+  int fz_ihi = (int) 1.0*(ipmid+1)*nmid/npmid - 1;
+  int fz_jlo = (int) 1.0*ipslow*nslow/npslow;					// J slow
+  int fz_jhi = (int) 1.0*(ipslow+1)*nslow/npslow - 1;
+
+ /* printf("[FZ-PENCIL] (k,i,j order)\t"
+		  "On rank %d the coordinates are: "
+		  "(%d,%d,%d) -> (%d,%d,%d)\n", rank, fz_ilo, fz_jlo, fz_klo, fz_ihi, fz_jhi, fz_khi ); */
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Final y-pencil
+  nfast = ny;
+  nmid = nz;
+  nslow = nx;
+
+  int y_jlo = (int) 1.0*ipfast*nfast/npfast;					// K fast
+  int y_jhi = (int) 1.0*(ipfast+1)*nfast/npfast - 1;
+  int y_klo = (int) 1.0*ipmid*nmid/npmid;						// I med
+  int y_khi = (int) 1.0*(ipmid+1)*nmid/npmid - 1;
+  int y_ilo = (int) 1.0*ipslow*nslow/npslow;					// J slow
+  int y_ihi = (int) 1.0*(ipslow+1)*nslow/npslow - 1;
+
+  printf("[Y-PENCIL] (j,k,i order)\t"
+		  "On rank %d the coordinates are: "
+		  "(%d,%d,%d) -> (%d,%d,%d)\n", rank, y_ilo, y_jlo, y_klo, y_ihi, y_jhi, y_khi );
+  MPI_Barrier(MPI_COMM_WORLD);
+ 
+  /******************************************* Size Variables ******************************************/
+  localdim_x_ = 2*nxd*(x_jhi-x_jlo+1)*(x_khi-x_klo+1);
+  localdim_z_ = 2*(z_ihi-z_ilo+1)*(z_jhi-z_jlo+1)*nzd;
+  dim_z_ = 2*(fz_ihi-fz_ilo+1)*(fz_jhi-fz_jlo+1)*(fz_khi-fz_klo+1);
+  dim_y_ = 2*(y_ihi-y_ilo+1)*(y_jhi-y_jlo+1)*(y_khi-y_klo+1);
+  ilo_ = y_ilo; 	jlo_ = y_jlo;	klo_ = y_klo;
+  ihi_ = y_ihi;		jhi_ = y_jhi;	khi_ = y_khi;
+
+  x_ilo_ = x_ilo, x_ihi_ = x_ihi, x_jlo_ = x_jlo, x_jhi_ = x_jhi, x_klo_ = x_klo, x_khi_ = x_khi;
+  y_ilo_ = y_ilo, y_ihi_ = y_ihi, y_jlo_ = y_jlo, y_jhi_ = y_jhi, y_klo_ = y_klo, y_khi_ = y_khi;
+  z_ilo_ = z_ilo, z_ihi_ = z_ihi, z_jlo_ = z_jlo, z_jhi_ = z_jhi, z_klo_ = z_klo, z_khi_ = z_khi;
+  fz_ilo_=fz_ilo, fz_ihi_=fz_ihi, fz_jlo_=fz_jlo, fz_jhi_=fz_jhi, fz_klo_=fz_klo, fz_khi_=fz_khi;
+  MPI_Barrier(MPI_COMM_WORLD);  *>
+!// Take into account the negative modes
+klo = klo - nz;		khi = khi - nz;
+jlo = jlo - 1;		jhi = jhi - 1;
+!// Determine which core owns (ix=0 iz=0) mode
+LOOP FOR ix=ilo TO ihi AND iz=klo TO khi
+	IF ix=0 AND iz=0 THEN 
+		rank_zero_flag = 100
+	END IF
+REPEAT LOOP
+<*	int *recv_data = (int *)malloc(sizeof(int) * size);
+	MPI_Allgather(&rank_zero_flag_,1,MPI_INT,recv_data,1,MPI_INT,MPI_COMM_WORLD);
+	//MPI_Allreduce(&rank_zero_flag_,&rank_zero_,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+	for(int i = 0; i < size; i++){
+		if ( recv_data[i] == 100 ) {
+			rank_zero_ = i;
+		}
+	}
+	MPI_Barrier(MPI_COMM_WORLD);	*>
+!// Fill the local array VV & V
+ARRAY(ilo..ihi, klo..khi,-1..ny+1) OF MOMFLUX VV 
+ARRAY(ilo..ihi, klo..khi,-1..ny+1) OF VELOCITY V 
+ARRAY(ilo..ihi, klo..khi,1..(ny-1),1..maxtimelevels) OF rhstype oldrhs
+rhstype memrhs(ilo..ihi,klo..khi,1..(ny-1))
+INLINE FUNCTION newrhs(INTEGER ix,iz,iy)=memrhs(ix,iz,(iy+1000)MOD(3))
+ARRAY(klo..khi,1..ny-1,-2..2) OF REAL D2vmat=0, etamat=0	
+ARRAY(ilo..ihi,klo..khi) OF STRUCTURE(COMPLEX u,v,w,vy,eta) bc0=0, bcn=0
+POINTER TO ARRAY(0..localdim_x-1) OF REAL u_convol
+POINTER TO ARRAY(0..localdim_x-1) OF REAL v_convol
+POINTER TO ARRAY(0..localdim_x-1) OF REAL w_convol
+POINTER TO ARRAY(0..localdim_x-1) OF REAL U_t
+POINTER TO ARRAY(0..localdim_x-1) OF REAL V_t
+POINTER TO ARRAY(0..localdim_x-1) OF REAL W_t
+POINTER TO ARRAY(0..localdim_x-1) OF REAL uu
+POINTER TO ARRAY(0..localdim_x-1) OF REAL uv
+POINTER TO ARRAY(0..localdim_x-1) OF REAL vv
+POINTER TO ARRAY(0..localdim_x-1) OF REAL vw
+POINTER TO ARRAY(0..localdim_x-1) OF REAL uw
+POINTER TO ARRAY(0..localdim_x-1) OF REAL ww
+POINTER TO ARRAY(0..localdim_x-1) OF REAL sendbuf
+POINTER TO ARRAY(0..localdim_x-1) OF REAL recvbuf
+POINTER TO ARRAY(0..localdim_x-1) OF REAL eta_write
+POINTER TO ARRAY(0..localdim_x-1) OF REAL v_write
+
+set_time

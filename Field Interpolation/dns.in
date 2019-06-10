@@ -1,0 +1,8 @@
+ny=100		nx=48	nz=48
+alfa0=1.2566	beta0=2.5132
+ymin=0		ymax=2		a=1.6
+ni=4760		pr=0.71	
+new_ny=128	new_nx=96	new_nz=80
+new_alfa0=0.5	new_beta0=1
+new_ni=180
+restart_file=Dati.cart.Re200Q.in

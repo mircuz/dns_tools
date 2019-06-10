@@ -1,0 +1,28 @@
+#include <mpi.h>
+#include <math.h>
+#include <stdlib.h>
+#include <time.h>
+#include "remap3d_wrap.h"
+#include "/home/mirco/Scrivania/hdf5/include/hdf5.h"
+#include "/home/mirco/Scrivania/hdf5/include/hdf5_hl.h"
+!//#include "/cineca/prod/opt/libraries/hdf5/1.8.18/openmpi--1-10.3--gnu--6.1.0/include/hdf5.h"
+!//#include "/cineca/prod/opt/libraries/hdf5/1.8.18/openmpi--1-10.3--gnu--6.1.0/include/hdf5_hl.h"
+
+INTEGER rank, size
+gamma=0
+USE dnsdata
+USE initialization
+USE data_man
+USE dnsdirect
+time=0
+
+read_restart_file;	move_data;	write_on_disk
+
+IF rank=0 THEN WRITE; WRITE "<Data ready>"; WRITE; WRITE; END IF
+<* 	MPI_Barrier(MPI_COMM_WORLD);
+	free(u_convol_);	free(v_convol_);	free(w_convol_);				//Worked uvw
+	free(U_t_);		free(V_t_);		free(W_t_);								//Local UVW copied into structure
+  	free(uu_);	free(uv_);	free(vv_);	free(vw_);	free(ww_);	free(uw_); 	//Local convols copied into structure
+	free(recvbuf_);	 free(sendbuf_);										//Remap local arrays
+	free(eta_write_);	 free(v_write_);
+	MPI_Finalize();	*>
