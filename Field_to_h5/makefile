@@ -7,7 +7,7 @@ HDF5_LIB= -L/home/mirco/Scrivania/hdf5/lib /home/mirco/Scrivania/hdf5/lib/libhdf
 			-Wl,--enable-new-dtags -L/usr/local/lib -lmpi
 REMAP_LIB= /home/mirco/Scrivania/fftmpi-1Oct18/src/libfft3dmpi.a 
 
-all: translation exe
+all: translation field_to_h5
 
 translation:
 	/usr/local/fri/fri /usr/local/fri/cpl channel_mpi.cpl
@@ -25,8 +25,8 @@ dnsdata.o: dnsdata.c
 dnsdirect.o: dnsdirect.c
 	$(CC) $(OPTFLAGS) -c dnsdirect.c
 
-exe: channel_mpi.o dnsdata.o dnsdirect.o data_man.o fft_support.o initialization.o
-	$(CCX) $(CFLAGS) -o exe channel_mpi.o initialization.o fft_support.o data_man.o dnsdata.o dnsdirect.o $(REMAP_LIB) $(HDF5_LIB)
+field_to_h5: channel_mpi.o dnsdata.o dnsdirect.o data_man.o fft_support.o initialization.o
+	$(CCX) $(CFLAGS) -o field_to_h5 channel_mpi.o initialization.o fft_support.o data_man.o dnsdata.o dnsdirect.o $(REMAP_LIB) $(HDF5_LIB)
 	make remove_useless
 		#--> Executable ready <--
 		#--> run as mpiexec -n "#procs" exe <--
@@ -43,7 +43,7 @@ clear:
 
 clean: 
 	make remove_useless
-	rm exe
+	rm field_to_h5
 	rm results/Field.h5
 	rm results/time_out
 	rm Runtimedata
